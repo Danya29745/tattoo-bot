@@ -1,6 +1,9 @@
 """
 VALHALLA Tattoo Bot — ВКонтакте
 pip install vk_api
+
+База данных SQLite — встроена в Python, ничего устанавливать не нужно.
+Файл базы: tattoo.db (создаётся автоматически рядом со скриптом)
 """
 
 import vk_api
@@ -10,6 +13,7 @@ import logging
 import random
 import os
 import time
+import sqlite3
 from datetime import datetime
 
 logging.basicConfig(
@@ -22,22 +26,106 @@ log = logging.getLogger(__name__)
 # ══════════════════════════════════════
 #  НАСТРОЙКИ
 # ══════════════════════════════════════
-GROUP_TOKEN  = "vk1.a.qM8MOyWFdXqj449qmyEMVh8_2u6ldFE2ZOkNADpq8Tr55JRc0xrEluF3bZDlPm9rfuFLHGRh1Zpw8YK72S2DGRh2rzkvGJMZQ1rg7-0zb4pMBF8WxhPug3CEUBN_aw3zN36zH-7QVCbraGpctmUePoRQj_Mp2SRFUKJCFzY_vtc5LDrlVlWRlVTCVI91EclOuwwp13BINZaOHd0_1JQXiw"
-GROUP_ID     = 238443976
-MASTER_VK_ID = 401276566
+GROUP_TOKEN  = os.environ.get("BOT_TOKEN") or os.environ.get("GROUP_TOKEN", "")
+GROUP_ID     = int(os.environ.get("GROUP_ID", "238443976"))
+MASTER_VK_ID = int(os.environ.get("MASTER_VK_ID", "401276566"))
 
-# Положи welcome.jpg рядом со скриптом — оно отправляется при первом входе
 WELCOME_PHOTO = "welcome.jpg"
+DB_FILE       = os.environ.get("DB_FILE", "data/tattoo.db")
 # ══════════════════════════════════════
 
-sessions:     dict = {}   # { user_id: { step, data } }
-known_users:  set  = set()
-master_state: dict = {"mode": "idle", "broadcast_text": ""}
+# В памяти храним только активные незавершённые анкеты
+sessions:          dict = {}
+master_state:      dict = {"mode": "idle", "broadcast_text": ""}
+vk_session_global       = None   # инициализируется в main()
 
 
-# ─────────────────────────────────────
+# ══════════════════════════════════════
+#  БАЗА ДАННЫХ
+# ══════════════════════════════════════
+
+def db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def db_init():
+    """Создаёт таблицы при первом запуске."""
+    os.makedirs(os.path.dirname(DB_FILE) or ".", exist_ok=True)
+    with db_connect() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS clients (
+                vk_id       INTEGER PRIMARY KEY,
+                first_name  TEXT,
+                last_name   TEXT,
+                created_at  TEXT DEFAULT (datetime('now','localtime'))
+            );
+
+            CREATE TABLE IF NOT EXISTS applications (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                vk_id        INTEGER,
+                size         TEXT,
+                age          TEXT,
+                contact_time TEXT,
+                has_photo    INTEGER DEFAULT 0,
+                has_sketch   INTEGER DEFAULT 0,
+                created_at   TEXT DEFAULT (datetime('now','localtime'))
+            );
+        """)
+    log.info("БД инициализирована: %s", DB_FILE)
+
+def db_add_client(vk_id: int, first_name: str, last_name: str):
+    """Добавляет клиента если его ещё нет."""
+    with db_connect() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO clients (vk_id, first_name, last_name)
+            VALUES (?, ?, ?)
+        """, (vk_id, first_name, last_name))
+
+def db_client_exists(vk_id: int) -> bool:
+    with db_connect() as conn:
+        row = conn.execute("SELECT 1 FROM clients WHERE vk_id = ?", (vk_id,)).fetchone()
+        return row is not None
+
+def db_save_application(vk_id: int, data: dict):
+    """Сохраняет заявку в базу."""
+    with db_connect() as conn:
+        conn.execute("""
+            INSERT INTO applications (vk_id, size, age, contact_time, has_photo, has_sketch)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            vk_id,
+            data.get("size", ""),
+            data.get("age", ""),
+            data.get("contact_time", ""),
+            1 if data.get("photo_attach") else 0,
+            1 if data.get("sketch_attach") else 0,
+        ))
+
+def db_get_all_clients() -> list:
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT vk_id, first_name, last_name, created_at FROM clients ORDER BY created_at DESC"
+        ).fetchall()
+
+def db_get_clients_count() -> int:
+    with db_connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
+
+def db_get_apps_count() -> int:
+    with db_connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0]
+
+def db_get_all_vk_ids() -> list:
+    """Возвращает список всех vk_id для рассылки."""
+    with db_connect() as conn:
+        rows = conn.execute("SELECT vk_id FROM clients").fetchall()
+        return [r["vk_id"] for r in rows]
+
+
+# ══════════════════════════════════════
 #  КЛАВИАТУРЫ
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 
 def kb_start():
     kb = VkKeyboard(one_time=True)
@@ -98,10 +186,22 @@ def kb_yes_no():
     kb.add_button("Отмена",     color=VkKeyboardColor.NEGATIVE)
     return kb.get_keyboard()
 
+def kb_permission():
+    kb = VkKeyboard(one_time=True)
+    kb.add_button("Да, разрешение есть",  color=VkKeyboardColor.POSITIVE)
+    kb.add_line()
+    kb.add_button("Нет, нужен шаблон",    color=VkKeyboardColor.NEGATIVE)
+    return kb.get_keyboard()
 
-# ─────────────────────────────────────
+def kb_form_done():
+    kb = VkKeyboard(one_time=True)
+    kb.add_button("Анкета заполнена",     color=VkKeyboardColor.POSITIVE)
+    return kb.get_keyboard()
+
+
+# ══════════════════════════════════════
 #  ОТПРАВКА
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 
 def send(vk, user_id: int, text: str, keyboard=None, attachment: str = None):
     params = dict(
@@ -116,9 +216,9 @@ def send(vk, user_id: int, text: str, keyboard=None, attachment: str = None):
     vk.messages.send(**params)
 
 
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 #  ВЛОЖЕНИЯ
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 
 def get_attach_string(vk, message_id: int) -> str:
     try:
@@ -144,13 +244,13 @@ def has_photo_in_event(event) -> bool:
     return any(raw.get(f"attach{i}_type") == "photo" for i in range(1, 11))
 
 
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 #  ЗАГРУЗКА ПРИВЕТСТВЕННОГО ФОТО
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 
 def upload_welcome_photo(vk_session) -> str:
     if not os.path.exists(WELCOME_PHOTO):
-        log.warning("welcome.jpg не найден — бот работает без приветственного фото")
+        log.warning("welcome.jpg не найден — бот работает без фото")
         return ""
     try:
         uploader = vk_api.VkUpload(vk_session)
@@ -165,9 +265,9 @@ def upload_welcome_photo(vk_session) -> str:
         return ""
 
 
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 #  ХЕЛПЕРЫ
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 
 def get_first_name(vk, uid: int) -> str:
     try:
@@ -175,19 +275,20 @@ def get_first_name(vk, uid: int) -> str:
     except Exception:
         return "Привет"
 
-def get_full_name(vk, uid: int) -> str:
+def get_full_name(vk, uid: int) -> tuple:
+    """Возвращает (first_name, last_name)."""
     try:
         u = vk.users.get(user_ids=uid)[0]
-        return f"{u['first_name']} {u['last_name']}"
+        return u["first_name"], u["last_name"]
     except Exception:
-        return f"id{uid}"
+        return "id" + str(uid), ""
 
-def make_summary(data: dict, name: str, uid: int) -> str:
+def make_summary(data: dict, first: str, last: str, uid: int) -> str:
     return "\n".join([
         "─────────────────────",
         "НОВАЯ АНКЕТА  |  VALHALLA",
         "─────────────────────",
-        f"Клиент:        {name}",
+        f"Клиент:        {first} {last}",
         f"Страница:      vk.com/id{uid}",
         f"Дата:          {datetime.now().strftime('%d.%m.%Y %H:%M')}",
         "",
@@ -195,15 +296,16 @@ def make_summary(data: dict, name: str, uid: int) -> str:
         f"Возраст:       {data.get('age', '—')} лет",
         f"Время связи:   {data.get('contact_time', '—')}",
         "",
-        f"Фото места:    {'есть' if data.get('photo_attach') else 'нет'}",
-        f"Эскиз:         {'есть' if data.get('sketch_attach') else 'нет'}",
+        f"Фото места:    {'есть ✅' if data.get('photo_attach') else 'нет'}",
+        f"Эскиз:         {'есть ✅' if data.get('sketch_attach') else 'нет'}",
+        f"Разрешение:    {'есть ✅' if data.get('permission_attach') else ('нужно у мастера ⚠️' if int(data.get('age','99')) < 18 else '—')}",
         "─────────────────────",
     ])
 
 
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 #  СТАРТ АНКЕТЫ
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 
 def start_form(vk, uid: int):
     sessions[uid] = {"step": "photo", "data": {}}
@@ -217,13 +319,14 @@ def start_form(vk, uid: int):
          keyboard=None)
 
 
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 #  РАССЫЛКА
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 
 def broadcast(vk, text: str) -> int:
+    ids  = db_get_all_vk_ids()
     sent = 0
-    for uid in list(known_users):
+    for uid in ids:
         if uid == MASTER_VK_ID:
             continue
         try:
@@ -235,9 +338,9 @@ def broadcast(vk, text: str) -> int:
     return sent
 
 
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 #  ГЛАВНЫЙ ОБРАБОТЧИК
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 
 START_WORDS = {
     "начать", "старт", "start", "/start",
@@ -253,8 +356,6 @@ def handle(vk, event, welcome_attach: str):
     msg_id    = event.message_id
     got_photo = has_photo_in_event(event)
 
-    known_users.add(uid)
-
     # ════════════════════════════════
     # МАСТЕР — админ-панель
     # ════════════════════════════════
@@ -264,10 +365,10 @@ def handle(vk, event, welcome_attach: str):
         if mode == "broadcast_wait_text":
             master_state["broadcast_text"] = raw_text
             master_state["mode"] = "broadcast_confirm"
-            clients_count = len([u for u in known_users if u != MASTER_VK_ID])
+            count = db_get_clients_count()
             send(vk, uid,
                  f"Текст рассылки:\n\n{raw_text}\n\n"
-                 f"Клиентов в базе: {clients_count}\n\n"
+                 f"Клиентов в базе: {count}\n\n"
                  "Отправить?",
                  keyboard=kb_yes_no())
             return
@@ -288,15 +389,14 @@ def handle(vk, event, welcome_attach: str):
             return
 
         if "список" in text:
-            clients = [u for u in known_users if u != MASTER_VK_ID]
+            clients = db_get_all_clients()
             if clients:
                 lines = []
-                for cid in clients[:50]:
-                    try:
-                        info = vk.users.get(user_ids=cid)[0]
-                        lines.append(f"• {info['first_name']} {info['last_name']} — vk.com/id{cid}")
-                    except Exception:
-                        lines.append(f"• vk.com/id{cid}")
+                for c in clients[:50]:
+                    lines.append(
+                        f"• {c['first_name']} {c['last_name']} — "
+                        f"vk.com/id{c['vk_id']} (с {c['created_at'][:10]})"
+                    )
                 send(vk, uid,
                      f"Клиентов в базе: {len(clients)}\n\n" + "\n".join(lines),
                      keyboard=kb_admin())
@@ -305,12 +405,14 @@ def handle(vk, event, welcome_attach: str):
             return
 
         if "статистика" in text:
-            clients = len([u for u in known_users if u != MASTER_VK_ID])
+            clients = db_get_clients_count()
+            apps    = db_get_apps_count()
             active  = len(sessions)
             send(vk, uid,
-                 f"Статистика:\n\n"
-                 f"Всего клиентов: {clients}\n"
-                 f"Анкет в процессе: {active}",
+                 f"📊 Статистика:\n\n"
+                 f"👥 Всего клиентов: {clients}\n"
+                 f"📋 Всего заявок: {apps}\n"
+                 f"⏳ Анкет в процессе: {active}",
                  keyboard=kb_admin())
             return
 
@@ -321,20 +423,32 @@ def handle(vk, event, welcome_attach: str):
     # КЛИЕНТ
     # ════════════════════════════════
 
-    # Стартовая команда / кнопка «Заполнить анкету»
+    # Стартовые команды / кнопка «Заполнить анкету»
     if text in START_WORDS:
+        # Регистрируем клиента в БД если ещё нет
+        if not db_client_exists(uid):
+            fn, ln = get_full_name(vk, uid)
+            db_add_client(uid, fn, ln)
         start_form(vk, uid)
         return
 
     # Первый раз — приветствие с фото
-    if uid not in sessions:
-        name = get_first_name(vk, uid)
+    if uid not in sessions and not db_client_exists(uid):
+        fn, ln = get_full_name(vk, uid)
+        db_add_client(uid, fn, ln)
         send(vk, uid,
-             f"👋 Привет, {name}!\n\n"
+             f"👋 Привет, {fn}!\n\n"
              "Добро пожаловать! Здесь ты можешь записаться на тату 🖤\n\n"
              "Нажми кнопку ниже, чтобы оставить заявку — мастер свяжется с тобой в ближайшее время.",
              keyboard=kb_start(),
              attachment=welcome_attach or None)
+        return
+
+    # Клиент уже знакомый, но не в активной сессии
+    if uid not in sessions:
+        send(vk, uid,
+             "Нажми «Заполнить анкету», чтобы оставить заявку 🖤",
+             keyboard=kb_start())
         return
 
     sess = sessions[uid]
@@ -418,14 +532,108 @@ def handle(vk, event, welcome_attach: str):
         digits = "".join(c for c in text if c.isdigit())
         if digits and 10 <= int(digits) <= 100:
             data["age"] = digits
-            sess["step"] = "contact_time"
-            send(vk, uid,
-                 f"✅ Возраст: {digits} лет\n\n"
-                 "📍 Шаг 5 из 5\n"
-                 "📞 Когда удобно получить сообщение или звонок от мастера?",
-                 keyboard=kb_contact_time())
+            age_int = int(digits)
+            if age_int < 18:
+                # Несовершеннолетний — спрашиваем про разрешение
+                sess["step"] = "minor_permission"
+                send(vk, uid,
+                     f"✅ Возраст: {digits} лет\n\n"
+                     "⚠️ Так как тебе нет 18 лет, для записи необходимо письменное "
+                     "разрешение от родителя или опекуна.\n\n"
+                     "У тебя уже есть подписанное разрешение?",
+                     keyboard=kb_permission())
+            else:
+                sess["step"] = "contact_time"
+                send(vk, uid,
+                     f"✅ Возраст: {digits} лет\n\n"
+                     "📍 Шаг 5 из 5\n"
+                     "📞 Когда удобно получить сообщение или звонок от мастера?",
+                     keyboard=kb_contact_time())
         else:
             send(vk, uid, "Введи возраст цифрами. Например: 24", keyboard=None)
+
+    # ── ШАГ 4б: разрешение родителей (несовершеннолетние) ────
+    elif step == "minor_permission":
+        if "нет" in text or "шаблон" in text:
+            # Загружаем и отправляем документ-шаблон
+            doc_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "razreshenie_roditeley.docx")
+            att_str = None
+            if os.path.exists(doc_path):
+                try:
+                    # Получаем upload server для документа
+                    vk_raw = vk_session_global.get_api()
+                    upload_data = vk_raw.docs.getMessagesUploadServer(type="doc", peer_id=uid)
+                    upload_url  = upload_data["upload_url"]
+
+                    import requests as _req
+                    with open(doc_path, "rb") as docf:
+                        resp = _req.post(upload_url, files={"file": ("razreshenie_roditeley.docx", docf)})
+                    file_data = resp.json().get("file", "")
+
+                    saved = vk_raw.docs.save(file=file_data, title="Разрешение родителей на тату")
+                    d = saved["doc"]
+                    att_str = f"doc{d['owner_id']}_{d['id']}"
+                    log.info("Документ загружен: %s", att_str)
+                except Exception as e:
+                    log.error("Ошибка загрузки документа: %s", e)
+            else:
+                log.warning("Файл razreshenie_roditeley.docx не найден по пути: %s", doc_path)
+
+            sess["step"] = "minor_doc"
+            msg = (
+                "📄 Держи шаблон разрешения!\n\n"
+                "Что нужно сделать:\n"
+                "1. Распечатай документ\n"
+                "2. Родитель заполняет и подписывает\n"
+                "3. Ты тоже подписываешь\n"
+                "4. Оригинал обязательно принеси на сеанс\n\n"
+                "Когда всё будет готово — нажми кнопку ниже 👇"
+            )
+            send(vk, uid, msg, keyboard=kb_form_done(), attachment=att_str)
+
+        elif "да" in text or "есть" in text:
+            # Разрешение уже есть — просим прислать скан/фото
+            sess["step"] = "minor_doc"
+            send(vk, uid,
+                 "✅ Отлично!\n\n"
+                 "📎 Пришли фото или скан заполненного разрешения прямо сюда — "
+                 "мастер проверит его заранее.\n\n"
+                 "Оригинал также обязательно принеси с собой на сеанс 🖤",
+                 keyboard=None)
+        else:
+            send(vk, uid, "Нажми одну из кнопок 👇", keyboard=kb_permission())
+
+    # ── ШАГ 4в: получение скана разрешения ───────────────────
+    elif step == "minor_doc":
+        if got_photo or "заполнена" in text or "готово" in text or "готов" in text:
+            if got_photo:
+                attach = get_attach_string(vk, msg_id)
+                data["permission_attach"] = attach
+                data["permission_msg_id"] = msg_id
+                msg_ok = (
+                    "✅ Скан получен! Мастер проверит его перед сеансом.\n\n"
+                    "‼️ Оригинал разрешения обязательно возьми с собой на сеанс — "
+                    "без него процедура не проводится.\n\n"
+                    "📍 Шаг 5 из 5\n"
+                    "📞 Когда удобно получить сообщение или звонок от мастера?"
+                )
+            else:
+                # Нажал «Анкета заполнена» без фото
+                data["permission_attach"] = None
+                msg_ok = (
+                    "👍 Принято!\n\n"
+                    "‼️ Обязательно принеси оригинал разрешения с собой на сеанс — "
+                    "без него процедура не проводится.\n\n"
+                    "📍 Шаг 5 из 5\n"
+                    "📞 Когда удобно получить сообщение или звонок от мастера?"
+                )
+            sess["step"] = "contact_time"
+            send(vk, uid, msg_ok, keyboard=kb_contact_time())
+        else:
+            send(vk, uid,
+                 "Пришли фото или скан заполненного разрешения, "
+                 "или нажми «Анкета заполнена» если принесёшь оригинал на сеанс 👇",
+                 keyboard=kb_form_done())
 
     # ── ШАГ 5: время для связи ───────────────────────────────
     elif step == "contact_time":
@@ -457,13 +665,16 @@ def handle(vk, event, welcome_attach: str):
             return
 
         if "отправ" in text or "верно" in text:
-            name    = get_full_name(vk, uid)
-            summary = make_summary(data, name, uid)
+            fn, ln = get_full_name(vk, uid)
+            summary = make_summary(data, fn, ln, uid)
+
+            # Сохраняем заявку в БД
+            db_save_application(uid, data)
+            log.info("Заявка сохранена в БД. uid=%s", uid)
 
             # 1. Текстовая сводка мастеру
             try:
                 send(vk, MASTER_VK_ID, summary)
-                log.info("Сводка отправлена. uid=%s name=%s", uid, name)
             except Exception as ex:
                 log.error("Сводка не отправлена: %s", ex)
 
@@ -471,19 +682,17 @@ def handle(vk, event, welcome_attach: str):
             if data.get("photo_attach"):
                 try:
                     send(vk, MASTER_VK_ID,
-                         f"📸 Фото места — {name} (vk.com/id{uid})",
+                         f"📸 Фото места — {fn} {ln} (vk.com/id{uid})",
                          attachment=data["photo_attach"])
-                    log.info("Фото места переслано.")
                 except Exception as ex:
-                    log.error("Фото через attachment не сработало (%s), пробую forward_messages...", ex)
+                    log.error("Фото через attachment (%s), пробую forward...", ex)
                     try:
                         vk.messages.send(
                             user_id=MASTER_VK_ID,
-                            message=f"📸 Фото места — {name} (vk.com/id{uid})",
+                            message=f"📸 Фото места — {fn} {ln} (vk.com/id{uid})",
                             forward_messages=str(data["photo_msg_id"]),
                             random_id=random.randint(0, 2 ** 31),
                         )
-                        log.info("Фото переслано через forward_messages.")
                     except Exception as ex2:
                         log.error("forward_messages тоже не сработал: %s", ex2)
 
@@ -491,21 +700,37 @@ def handle(vk, event, welcome_attach: str):
             if data.get("sketch_attach"):
                 try:
                     send(vk, MASTER_VK_ID,
-                         f"✏️ Эскиз — {name} (vk.com/id{uid})",
+                         f"✏️ Эскиз — {fn} {ln} (vk.com/id{uid})",
                          attachment=data["sketch_attach"])
-                    log.info("Эскиз переслан.")
                 except Exception as ex:
-                    log.error("Эскиз через attachment не сработало (%s), пробую forward_messages...", ex)
+                    log.error("Эскиз через attachment (%s), пробую forward...", ex)
                     try:
                         vk.messages.send(
                             user_id=MASTER_VK_ID,
-                            message=f"✏️ Эскиз — {name} (vk.com/id{uid})",
+                            message=f"✏️ Эскиз — {fn} {ln} (vk.com/id{uid})",
                             forward_messages=str(data["sketch_msg_id"]),
                             random_id=random.randint(0, 2 ** 31),
                         )
-                        log.info("Эскиз переслан через forward_messages.")
                     except Exception as ex2:
                         log.error("forward_messages для эскиза не сработал: %s", ex2)
+
+            # 3б. Скан разрешения родителей (если есть)
+            if data.get("permission_attach"):
+                try:
+                    send(vk, MASTER_VK_ID,
+                         f"📋 Разрешение родителей — {fn} {ln} (vk.com/id{uid})",
+                         attachment=data["permission_attach"])
+                except Exception as ex:
+                    log.error("Скан разрешения через attachment (%s), пробую forward...", ex)
+                    try:
+                        vk.messages.send(
+                            user_id=MASTER_VK_ID,
+                            message=f"📋 Разрешение родителей — {fn} {ln} (vk.com/id{uid})",
+                            forward_messages=str(data["permission_msg_id"]),
+                            random_id=random.randint(0, 2 ** 31),
+                        )
+                    except Exception as ex2:
+                        log.error("forward_messages для разрешения не сработал: %s", ex2)
 
             # 4. Финальное сообщение клиенту
             send(vk, uid,
@@ -527,18 +752,24 @@ def handle(vk, event, welcome_attach: str):
         start_form(vk, uid)
 
 
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 #  ЗАПУСК
-# ─────────────────────────────────────
+# ══════════════════════════════════════
 
 def main():
-    vk_session = vk_api.VkApi(token=GROUP_TOKEN)
-    vk         = vk_session.get_api()
-    longpoll   = VkLongPoll(vk_session, group_id=GROUP_ID)
+    global vk_session_global
+    if not GROUP_TOKEN:
+        raise SystemExit("Укажите BOT_TOKEN (токен группы VK) в переменных окружения.")
+    db_init()  # создаёт tattoo.db при первом запуске
+
+    vk_session        = vk_api.VkApi(token=GROUP_TOKEN)
+    vk_session_global = vk_session   # нужен для загрузки документов внутри handle()
+    vk                = vk_session.get_api()
+    longpoll          = VkLongPoll(vk_session, group_id=GROUP_ID)
 
     welcome_attach = upload_welcome_photo(vk_session)
 
-    log.info("VALHALLA Bot запущен. Ожидаю сообщения...")
+    log.info("VALHALLA Bot запущен. БД: %s", os.path.abspath(DB_FILE))
 
     for event in longpoll.listen():
         if event.type == VkEventType.MESSAGE_NEW and event.to_me:
