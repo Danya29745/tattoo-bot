@@ -7,7 +7,7 @@ pip install vk_api
 """
 
 import vk_api
-from vk_api.longpoll import VkLongPoll, VkEventType
+from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 import logging
 import random
@@ -294,8 +294,8 @@ def get_attach_string(vk, message_id: int) -> str:
         return ""
 
 def has_photo_in_event(event) -> bool:
-    raw = event.attachments or {}
-    return any(raw.get(f"attach{i}_type") == "photo" for i in range(1, 11))
+    atts = event.get("attachments", [])
+    return any(att.get("type") == "photo" for att in atts)
 
 
 # ══════════════════════════════════════
@@ -404,11 +404,16 @@ START_WORDS = {
 }
 
 def handle(vk, event, welcome_attach: str):
-    uid       = event.user_id
-    raw_text  = (event.text or "").strip()
+    uid       = event["from_id"]
+    raw_text  = (event.get("text") or "").strip()
     text      = raw_text.lower()
-    msg_id    = event.message_id
-    got_photo = has_photo_in_event(event)
+    msg_id    = event["id"]
+
+    class FakeEvent:
+        def __init__(self, data):
+            self.attachments = data.get("attachments", [])
+
+    got_photo = any(att.get("type") == "photo" for att in event.get("attachments", []))
 
     # Защита от повторной обработки одного и того же сообщения
     # Из-за особенностей VK LongPoll один и тот же event
@@ -839,18 +844,18 @@ def main():
     vk_session        = vk_api.VkApi(token=GROUP_TOKEN)
     vk_session_global = vk_session   # нужен для загрузки документов внутри handle()
     vk                = vk_session.get_api()
-    longpoll          = VkLongPoll(vk_session, group_id=GROUP_ID)
+    longpoll          = VkBotLongPoll(vk_session, GROUP_ID)
 
     welcome_attach = upload_welcome_photo(vk_session)
 
     log.info("VALHALLA Bot запущен. PID=%s БД: %s", os.getpid(), os.path.abspath(DB_FILE))
 
     for event in longpoll.listen():
-        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+        if event.type == VkBotEventType.MESSAGE_NEW:
             try:
-                handle(vk, event, welcome_attach)
+                handle(vk, event.object.message, welcome_attach)
             except Exception as e:
-                log.exception("Ошибка (uid=%s): %s", getattr(event, "user_id", "?"), e)
+                log.exception("Ошибка: %s", e)
 
 
 if __name__ == "__main__":
