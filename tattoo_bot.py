@@ -41,7 +41,23 @@ master_state:      dict = {"mode": "idle", "broadcast_text": ""}
 vk_session_global       = None   # инициализируется в main()
 
 # Защита от двойной обработки сообщений
+# VK иногда может присылать один и тот же event повторно.
+# Храним не только message_id, но и user_id.
 processed_messages = set()
+
+def is_duplicate_message(user_id: int, message_id: int) -> bool:
+    key = (user_id, message_id)
+
+    if key in processed_messages:
+        return True
+
+    processed_messages.add(key)
+
+    # Чтобы set не рос бесконечно
+    if len(processed_messages) > 10000:
+        processed_messages.clear()
+
+    return False
 
 
 # ══════════════════════════════════════
@@ -360,9 +376,11 @@ def handle(vk, event, welcome_attach: str):
     got_photo = has_photo_in_event(event)
 
     # Защита от повторной обработки одного и того же сообщения
-    if msg_id in processed_messages:
+    # Из-за особенностей VK LongPoll один и тот же event
+    # иногда приходит дважды почти одновременно.
+    if is_duplicate_message(uid, msg_id):
+        log.info("Дубликат сообщения проигнорирован: uid=%s msg_id=%s", uid, msg_id)
         return
-    processed_messages.add(msg_id)
 
     # ════════════════════════════════
     # МАСТЕР — админ-панель
@@ -507,6 +525,7 @@ def handle(vk, event, welcome_attach: str):
                  "📍 Шаг 3 из 5\n"
                  "📏 Выбери примерный размер тату:",
                  keyboard=kb_size())
+            return
         else:
             send(vk, uid,
                  "Пришли фото эскиза или нажми «Пропустить» 👇",
