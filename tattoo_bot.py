@@ -14,6 +14,7 @@ import random
 import os
 import time
 import sqlite3
+import sys
 from datetime import datetime
 
 logging.basicConfig(
@@ -41,9 +42,48 @@ master_state:      dict = {"mode": "idle", "broadcast_text": ""}
 vk_session_global       = None   # инициализируется в main()
 
 # Защита от двойной обработки сообщений
-# Используем связку user_id + conversation_message_id/message_id,
-# потому что VK LongPoll иногда присылает одно и то же событие повторно.
+# VK иногда может присылать один и тот же event повторно.
+# Храним не только message_id, но и user_id.
 processed_messages = set()
+
+# Защита от запуска двух копий бота одновременно
+# Если запущено 2 процесса — каждый отвечает на сообщение,
+# из-за этого пользователь получает дубли.
+LOCK_FILE = "bot.lock"
+
+def ensure_single_instance():
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, "r", encoding="utf-8") as f:
+                old_pid = f.read().strip()
+
+            # Проверяем существует ли процесс
+            if old_pid:
+                try:
+                    os.kill(int(old_pid), 0)
+                    print(f"Бот уже запущен! PID: {old_pid}")
+                    sys.exit(1)
+                except:
+                    pass
+        except:
+            pass
+
+    with open(LOCK_FILE, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+def is_duplicate_message(user_id: int, message_id: int) -> bool:
+    key = (user_id, message_id)
+
+    if key in processed_messages:
+        return True
+
+    processed_messages.add(key)
+
+    # Чтобы set не рос бесконечно
+    if len(processed_messages) > 10000:
+        processed_messages.clear()
+
+    return False
 
 
 # ══════════════════════════════════════
@@ -362,24 +402,11 @@ def handle(vk, event, welcome_attach: str):
     got_photo = has_photo_in_event(event)
 
     # Защита от повторной обработки одного и того же сообщения
-    # VK иногда дублирует MESSAGE_NEW события.
-    # message_id может повторяться некорректно, поэтому используем
-    # более стабильный ключ из user_id + conversation_message_id/message_id.
-    event_key = (
-        uid,
-        getattr(event, "conversation_message_id", None),
-        msg_id,
-    )
-
-    if event_key in processed_messages:
-        log.warning("Дубликат события проигнорирован: %s", event_key)
+    # Из-за особенностей VK LongPoll один и тот же event
+    # иногда приходит дважды почти одновременно.
+    if is_duplicate_message(uid, msg_id):
+        log.info("Дубликат сообщения проигнорирован: uid=%s msg_id=%s", uid, msg_id)
         return
-
-    processed_messages.add(event_key)
-
-    # Ограничиваем размер памяти, чтобы set не рос бесконечно
-    if len(processed_messages) > 10000:
-        processed_messages.clear()
 
     # ════════════════════════════════
     # МАСТЕР — админ-панель
@@ -524,6 +551,7 @@ def handle(vk, event, welcome_attach: str):
                  "📍 Шаг 3 из 5\n"
                  "📏 Выбери примерный размер тату:",
                  keyboard=kb_size())
+            return
         else:
             send(vk, uid,
                  "Пришли фото эскиза или нажми «Пропустить» 👇",
@@ -694,6 +722,7 @@ def handle(vk, event, welcome_attach: str):
     elif step == "confirm":
         if "заново" in text or "начать" in text:
             sessions.pop(uid, None)
+            return
             start_form(vk, uid)
             return
 
@@ -792,6 +821,8 @@ def handle(vk, event, welcome_attach: str):
 # ══════════════════════════════════════
 
 def main():
+    ensure_single_instance()
+
     global vk_session_global
     db_init()  # создаёт tattoo.db при первом запуске
 
@@ -802,7 +833,7 @@ def main():
 
     welcome_attach = upload_welcome_photo(vk_session)
 
-    log.info("VALHALLA Bot запущен. БД: %s", os.path.abspath(DB_FILE))
+    log.info("VALHALLA Bot запущен. PID=%s БД: %s", os.getpid(), os.path.abspath(DB_FILE))
 
     for event in longpoll.listen():
         if event.type == VkEventType.MESSAGE_NEW and event.to_me:
