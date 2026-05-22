@@ -40,6 +40,9 @@ sessions:          dict = {}
 master_state:      dict = {"mode": "idle", "broadcast_text": ""}
 vk_session_global       = None   # инициализируется в main()
 
+# Защита от двойной обработки сообщений
+processed_messages = set()
+
 
 # ══════════════════════════════════════
 #  БАЗА ДАННЫХ
@@ -356,6 +359,11 @@ def handle(vk, event, welcome_attach: str):
     msg_id    = event.message_id
     got_photo = has_photo_in_event(event)
 
+    # Защита от повторной обработки одного и того же сообщения
+    if msg_id in processed_messages:
+        return
+    processed_messages.add(msg_id)
+
     # ════════════════════════════════
     # МАСТЕР — админ-панель
     # ════════════════════════════════
@@ -470,11 +478,13 @@ def handle(vk, event, welcome_attach: str):
                  "подгонит под нужный размер и форму, а потом пришлёт как это будет смотреться именно на тебе.\n\n"
                  "Если ничего нет — нажми «Пропустить».",
                  keyboard=kb_sketch())
+            return
         else:
             send(vk, uid,
                  "Прикрепи фото места нанесения и отправь 📷\n\n"
                  "Просто выбери картинку из галереи и пришли её сюда.",
                  keyboard=None)
+            return
 
     # ── ШАГ 2: эскиз ─────────────────────────────────────────
     elif step == "sketch":
@@ -488,6 +498,7 @@ def handle(vk, event, welcome_attach: str):
                  "📍 Шаг 3 из 5\n"
                  "📏 Выбери примерный размер тату:",
                  keyboard=kb_size())
+            return
         elif any(w in text for w in ("пропуст", "нет", "эскиза нет")):
             data["sketch_attach"] = None
             sess["step"] = "size"
@@ -542,6 +553,7 @@ def handle(vk, event, welcome_attach: str):
                      "разрешение от родителя или опекуна.\n\n"
                      "У тебя уже есть подписанное разрешение?",
                      keyboard=kb_permission())
+                return
             else:
                 sess["step"] = "contact_time"
                 send(vk, uid,
@@ -549,8 +561,10 @@ def handle(vk, event, welcome_attach: str):
                      "📍 Шаг 5 из 5\n"
                      "📞 Когда удобно получить сообщение или звонок от мастера?",
                      keyboard=kb_contact_time())
+                return
         else:
             send(vk, uid, "Введи возраст цифрами. Например: 24", keyboard=None)
+            return
 
     # ── ШАГ 4б: разрешение родителей (несовершеннолетние) ────
     elif step == "minor_permission":
@@ -629,6 +643,7 @@ def handle(vk, event, welcome_attach: str):
                 )
             sess["step"] = "contact_time"
             send(vk, uid, msg_ok, keyboard=kb_contact_time())
+            return
         else:
             send(vk, uid,
                  "Пришли фото или скан заполненного разрешения, "
@@ -654,6 +669,7 @@ def handle(vk, event, welcome_attach: str):
                 "Всё верно? 👇"
             )
             send(vk, uid, preview, keyboard=kb_confirm())
+            return
         else:
             send(vk, uid, "Нажми одну из кнопок с временем 👇", keyboard=kb_contact_time())
 
@@ -661,6 +677,7 @@ def handle(vk, event, welcome_attach: str):
     elif step == "confirm":
         if "заново" in text or "начать" in text:
             sessions.pop(uid, None)
+            return
             start_form(vk, uid)
             return
 
