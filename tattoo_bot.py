@@ -26,12 +26,13 @@ log = logging.getLogger(__name__)
 # ══════════════════════════════════════
 #  НАСТРОЙКИ
 # ══════════════════════════════════════
-GROUP_TOKEN  = os.environ.get("BOT_TOKEN") or os.environ.get("GROUP_TOKEN", "")
-GROUP_ID     = int(os.environ.get("GROUP_ID", "238443976"))
-MASTER_VK_ID = int(os.environ.get("MASTER_VK_ID", "401276566"))
+GROUP_TOKEN  = "vk1.a.qM8MOyWFdXqj449qmyEMVh8_2u6ldFE2ZOkNADpq8Tr55JRc0xrEluF3bZDlPm9rfuFLHGRh1Zpw8YK72S2DGRh2rzkvGJMZQ1rg7-0zb4pMBF8WxhPug3CEUBN_aw3zN36zH-7QVCbraGpctmUePoRQj_Mp2SRFUKJCFzY_vtc5LDrlVlWRlVTCVI91EclOuwwp13BINZaOHd0_1JQXiw"
+GROUP_ID     = 238443976
+MASTER_VK_ID  = 401276566       # главный мастер — получает заявки
+ADMIN_IDS     = {401276566, 156902715}  # все админы — имеют доступ к панели
 
 WELCOME_PHOTO = "welcome.jpg"
-DB_FILE       = os.environ.get("DB_FILE", "data/tattoo.db")
+DB_FILE       = "tattoo.db"
 # ══════════════════════════════════════
 
 # В памяти храним только активные незавершённые анкеты
@@ -51,7 +52,6 @@ def db_connect() -> sqlite3.Connection:
 
 def db_init():
     """Создаёт таблицы при первом запуске."""
-    os.makedirs(os.path.dirname(DB_FILE) or ".", exist_ok=True)
     with db_connect() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS clients (
@@ -327,7 +327,7 @@ def broadcast(vk, text: str) -> int:
     ids  = db_get_all_vk_ids()
     sent = 0
     for uid in ids:
-        if uid == MASTER_VK_ID:
+        if uid in ADMIN_IDS:
             continue
         try:
             send(vk, uid, text)
@@ -359,7 +359,7 @@ def handle(vk, event, welcome_attach: str):
     # ════════════════════════════════
     # МАСТЕР — админ-панель
     # ════════════════════════════════
-    if uid == MASTER_VK_ID:
+    if uid in ADMIN_IDS:
         mode = master_state["mode"]
 
         if mode == "broadcast_wait_text":
@@ -672,65 +672,67 @@ def handle(vk, event, welcome_attach: str):
             db_save_application(uid, data)
             log.info("Заявка сохранена в БД. uid=%s", uid)
 
-            # 1. Текстовая сводка мастеру
-            try:
-                send(vk, MASTER_VK_ID, summary)
-            except Exception as ex:
-                log.error("Сводка не отправлена: %s", ex)
-
-            # 2. Фото места нанесения
-            if data.get("photo_attach"):
+            # 1-3. Рассылаем заявку всем админам
+            for admin_id in ADMIN_IDS:
+                # Текстовая сводка
                 try:
-                    send(vk, MASTER_VK_ID,
-                         f"📸 Фото места — {fn} {ln} (vk.com/id{uid})",
-                         attachment=data["photo_attach"])
+                    send(vk, admin_id, summary)
                 except Exception as ex:
-                    log.error("Фото через attachment (%s), пробую forward...", ex)
-                    try:
-                        vk.messages.send(
-                            user_id=MASTER_VK_ID,
-                            message=f"📸 Фото места — {fn} {ln} (vk.com/id{uid})",
-                            forward_messages=str(data["photo_msg_id"]),
-                            random_id=random.randint(0, 2 ** 31),
-                        )
-                    except Exception as ex2:
-                        log.error("forward_messages тоже не сработал: %s", ex2)
+                    log.error("Сводка не отправлена admin=%s: %s", admin_id, ex)
 
-            # 3. Эскиз
-            if data.get("sketch_attach"):
-                try:
-                    send(vk, MASTER_VK_ID,
-                         f"✏️ Эскиз — {fn} {ln} (vk.com/id{uid})",
-                         attachment=data["sketch_attach"])
-                except Exception as ex:
-                    log.error("Эскиз через attachment (%s), пробую forward...", ex)
+                # Фото места нанесения
+                if data.get("photo_attach"):
                     try:
-                        vk.messages.send(
-                            user_id=MASTER_VK_ID,
-                            message=f"✏️ Эскиз — {fn} {ln} (vk.com/id{uid})",
-                            forward_messages=str(data["sketch_msg_id"]),
-                            random_id=random.randint(0, 2 ** 31),
-                        )
-                    except Exception as ex2:
-                        log.error("forward_messages для эскиза не сработал: %s", ex2)
+                        send(vk, admin_id,
+                             f"📸 Фото места — {fn} {ln} (vk.com/id{uid})",
+                             attachment=data["photo_attach"])
+                    except Exception as ex:
+                        log.error("Фото admin=%s attachment (%s), пробую forward...", admin_id, ex)
+                        try:
+                            vk.messages.send(
+                                user_id=admin_id,
+                                message=f"📸 Фото места — {fn} {ln} (vk.com/id{uid})",
+                                forward_messages=str(data["photo_msg_id"]),
+                                random_id=random.randint(0, 2 ** 31),
+                            )
+                        except Exception as ex2:
+                            log.error("forward_messages фото admin=%s: %s", admin_id, ex2)
 
-            # 3б. Скан разрешения родителей (если есть)
-            if data.get("permission_attach"):
-                try:
-                    send(vk, MASTER_VK_ID,
-                         f"📋 Разрешение родителей — {fn} {ln} (vk.com/id{uid})",
-                         attachment=data["permission_attach"])
-                except Exception as ex:
-                    log.error("Скан разрешения через attachment (%s), пробую forward...", ex)
+                # Эскиз
+                if data.get("sketch_attach"):
                     try:
-                        vk.messages.send(
-                            user_id=MASTER_VK_ID,
-                            message=f"📋 Разрешение родителей — {fn} {ln} (vk.com/id{uid})",
-                            forward_messages=str(data["permission_msg_id"]),
-                            random_id=random.randint(0, 2 ** 31),
-                        )
-                    except Exception as ex2:
-                        log.error("forward_messages для разрешения не сработал: %s", ex2)
+                        send(vk, admin_id,
+                             f"✏️ Эскиз — {fn} {ln} (vk.com/id{uid})",
+                             attachment=data["sketch_attach"])
+                    except Exception as ex:
+                        log.error("Эскиз admin=%s attachment (%s), пробую forward...", admin_id, ex)
+                        try:
+                            vk.messages.send(
+                                user_id=admin_id,
+                                message=f"✏️ Эскиз — {fn} {ln} (vk.com/id{uid})",
+                                forward_messages=str(data["sketch_msg_id"]),
+                                random_id=random.randint(0, 2 ** 31),
+                            )
+                        except Exception as ex2:
+                            log.error("forward_messages эскиз admin=%s: %s", admin_id, ex2)
+
+                # Скан разрешения родителей (если есть)
+                if data.get("permission_attach"):
+                    try:
+                        send(vk, admin_id,
+                             f"📋 Разрешение родителей — {fn} {ln} (vk.com/id{uid})",
+                             attachment=data["permission_attach"])
+                    except Exception as ex:
+                        log.error("Разрешение admin=%s attachment (%s), пробую forward...", admin_id, ex)
+                        try:
+                            vk.messages.send(
+                                user_id=admin_id,
+                                message=f"📋 Разрешение родителей — {fn} {ln} (vk.com/id{uid})",
+                                forward_messages=str(data["permission_msg_id"]),
+                                random_id=random.randint(0, 2 ** 31),
+                            )
+                        except Exception as ex2:
+                            log.error("forward_messages разрешение admin=%s: %s", admin_id, ex2)
 
             # 4. Финальное сообщение клиенту
             send(vk, uid,
@@ -758,8 +760,6 @@ def handle(vk, event, welcome_attach: str):
 
 def main():
     global vk_session_global
-    if not GROUP_TOKEN:
-        raise SystemExit("Укажите BOT_TOKEN (токен группы VK) в переменных окружения.")
     db_init()  # создаёт tattoo.db при первом запуске
 
     vk_session        = vk_api.VkApi(token=GROUP_TOKEN)
