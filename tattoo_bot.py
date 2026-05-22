@@ -7,13 +7,14 @@ pip install vk_api
 """
 
 import vk_api
-from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
+from vk_api.longpoll import VkLongPoll, VkEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 import logging
 import random
 import os
 import time
 import sqlite3
+import sys
 from datetime import datetime
 
 logging.basicConfig(
@@ -37,11 +38,61 @@ DB_FILE       = "tattoo.db"
 
 # В памяти храним только активные незавершённые анкеты
 sessions:          dict = {}
-master_state:      dict = {"mode": "idle", "broadcast_text": ""}
+# Состояние рассылки отдельно для каждого админа { admin_id: {"mode": ..., "broadcast_text": ...} }
+admin_states: dict = {}
 vk_session_global       = None   # инициализируется в main()
 
 # Защита от двойной обработки сообщений
+# VK иногда может присылать один и тот же event повторно.
+# Храним не только message_id, но и user_id.
 processed_messages = set()
+
+# Защита от запуска двух копий бота одновременно
+# Если запущено 2 процесса — каждый отвечает на сообщение,
+# из-за этого пользователь получает дубли.
+LOCK_FILE = "bot.lock"
+
+def ensure_single_instance():
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, "r", encoding="utf-8") as f:
+                old_pid = f.read().strip()
+
+            # Проверяем существует ли процесс
+            if old_pid:
+                try:
+                    os.kill(int(old_pid), 0)
+                    print(f"Бот уже запущен! PID: {old_pid}")
+                    sys.exit(1)
+                except:
+                    pass
+        except:
+            pass
+
+    with open(LOCK_FILE, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+def is_duplicate_message(user_id: int, message_id: int) -> bool:
+    key = (user_id, message_id)
+
+    if key in processed_messages:
+        return True
+
+    processed_messages.add(key)
+
+    # Чтобы set не рос бесконечно — удаляем случайную половину
+    if len(processed_messages) > 10000:
+        to_remove = list(processed_messages)[:5000]
+        for k in to_remove:
+            processed_messages.discard(k)
+
+    return False
+
+
+def get_admin_state(uid: int) -> dict:
+    if uid not in admin_states:
+        admin_states[uid] = {"mode": "idle", "broadcast_text": ""}
+    return admin_states[uid]
 
 
 # ══════════════════════════════════════
@@ -360,19 +411,22 @@ def handle(vk, event, welcome_attach: str):
     got_photo = has_photo_in_event(event)
 
     # Защита от повторной обработки одного и того же сообщения
-    if msg_id in processed_messages:
+    # Из-за особенностей VK LongPoll один и тот же event
+    # иногда приходит дважды почти одновременно.
+    if is_duplicate_message(uid, msg_id):
+        log.info("Дубликат сообщения проигнорирован: uid=%s msg_id=%s", uid, msg_id)
         return
-    processed_messages.add(msg_id)
 
     # ════════════════════════════════
     # МАСТЕР — админ-панель
     # ════════════════════════════════
     if uid in ADMIN_IDS:
-        mode = master_state["mode"]
+        astate = get_admin_state(uid)
+        mode = astate["mode"]
 
         if mode == "broadcast_wait_text":
-            master_state["broadcast_text"] = raw_text
-            master_state["mode"] = "broadcast_confirm"
+            astate["broadcast_text"] = raw_text
+            astate["mode"] = "broadcast_confirm"
             count = db_get_clients_count()
             send(vk, uid,
                  f"Текст рассылки:\n\n{raw_text}\n\n"
@@ -383,16 +437,17 @@ def handle(vk, event, welcome_attach: str):
 
         if mode == "broadcast_confirm":
             if "отправ" in text:
-                master_state["mode"] = "idle"
-                n = broadcast(vk, master_state["broadcast_text"])
+                astate["mode"] = "idle"
+                n = broadcast(vk, astate["broadcast_text"])
                 send(vk, uid, f"Готово! Сообщение отправлено {n} клиентам.", keyboard=kb_admin())
             else:
-                master_state["mode"] = "idle"
+                astate["mode"] = "idle"
                 send(vk, uid, "Рассылка отменена.", keyboard=kb_admin())
             return
 
         if "рассылка" in text:
-            master_state["mode"] = "broadcast_wait_text"
+            astate = get_admin_state(uid)
+            astate["mode"] = "broadcast_wait_text"
             send(vk, uid, "Введи текст рассылки:")
             return
 
@@ -507,6 +562,7 @@ def handle(vk, event, welcome_attach: str):
                  "📍 Шаг 3 из 5\n"
                  "📏 Выбери примерный размер тату:",
                  keyboard=kb_size())
+            return
         else:
             send(vk, uid,
                  "Пришли фото эскиза или нажми «Пропустить» 👇",
@@ -677,7 +733,6 @@ def handle(vk, event, welcome_attach: str):
     elif step == "confirm":
         if "заново" in text or "начать" in text:
             sessions.pop(uid, None)
-            return
             start_form(vk, uid)
             return
 
@@ -776,22 +831,24 @@ def handle(vk, event, welcome_attach: str):
 # ══════════════════════════════════════
 
 def main():
+    ensure_single_instance()
+
     global vk_session_global
     db_init()  # создаёт tattoo.db при первом запуске
 
     vk_session        = vk_api.VkApi(token=GROUP_TOKEN)
     vk_session_global = vk_session   # нужен для загрузки документов внутри handle()
     vk                = vk_session.get_api()
-    longpoll          = VkBotLongPoll(vk_session, GROUP_ID)
+    longpoll          = VkLongPoll(vk_session, group_id=GROUP_ID)
 
     welcome_attach = upload_welcome_photo(vk_session)
 
-    log.info("VALHALLA Bot запущен. БД: %s", os.path.abspath(DB_FILE))
+    log.info("VALHALLA Bot запущен. PID=%s БД: %s", os.getpid(), os.path.abspath(DB_FILE))
 
     for event in longpoll.listen():
-        if event.type == VkBotEventType.MESSAGE_NEW:
+        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
             try:
-                handle(vk, event.object.message, welcome_attach)
+                handle(vk, event, welcome_attach)
             except Exception as e:
                 log.exception("Ошибка (uid=%s): %s", getattr(event, "user_id", "?"), e)
 
