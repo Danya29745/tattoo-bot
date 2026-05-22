@@ -41,23 +41,9 @@ master_state:      dict = {"mode": "idle", "broadcast_text": ""}
 vk_session_global       = None   # инициализируется в main()
 
 # Защита от двойной обработки сообщений
-# VK иногда может присылать один и тот же event повторно.
-# Храним не только message_id, но и user_id.
+# Используем связку user_id + conversation_message_id/message_id,
+# потому что VK LongPoll иногда присылает одно и то же событие повторно.
 processed_messages = set()
-
-def is_duplicate_message(user_id: int, message_id: int) -> bool:
-    key = (user_id, message_id)
-
-    if key in processed_messages:
-        return True
-
-    processed_messages.add(key)
-
-    # Чтобы set не рос бесконечно
-    if len(processed_messages) > 10000:
-        processed_messages.clear()
-
-    return False
 
 
 # ══════════════════════════════════════
@@ -376,11 +362,24 @@ def handle(vk, event, welcome_attach: str):
     got_photo = has_photo_in_event(event)
 
     # Защита от повторной обработки одного и того же сообщения
-    # Из-за особенностей VK LongPoll один и тот же event
-    # иногда приходит дважды почти одновременно.
-    if is_duplicate_message(uid, msg_id):
-        log.info("Дубликат сообщения проигнорирован: uid=%s msg_id=%s", uid, msg_id)
+    # VK иногда дублирует MESSAGE_NEW события.
+    # message_id может повторяться некорректно, поэтому используем
+    # более стабильный ключ из user_id + conversation_message_id/message_id.
+    event_key = (
+        uid,
+        getattr(event, "conversation_message_id", None),
+        msg_id,
+    )
+
+    if event_key in processed_messages:
+        log.warning("Дубликат события проигнорирован: %s", event_key)
         return
+
+    processed_messages.add(event_key)
+
+    # Ограничиваем размер памяти, чтобы set не рос бесконечно
+    if len(processed_messages) > 10000:
+        processed_messages.clear()
 
     # ════════════════════════════════
     # МАСТЕР — админ-панель
@@ -525,7 +524,6 @@ def handle(vk, event, welcome_attach: str):
                  "📍 Шаг 3 из 5\n"
                  "📏 Выбери примерный размер тату:",
                  keyboard=kb_size())
-            return
         else:
             send(vk, uid,
                  "Пришли фото эскиза или нажми «Пропустить» 👇",
@@ -696,7 +694,6 @@ def handle(vk, event, welcome_attach: str):
     elif step == "confirm":
         if "заново" in text or "начать" in text:
             sessions.pop(uid, None)
-            return
             start_form(vk, uid)
             return
 
