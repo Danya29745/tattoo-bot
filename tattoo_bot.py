@@ -13,7 +13,6 @@ import logging
 import random
 import time
 import sqlite3
-import sys
 from datetime import datetime
 
 logging.basicConfig(
@@ -27,18 +26,18 @@ log = logging.getLogger(__name__)
 #  НАСТРОЙКИ — читаем из переменных окружения
 #  (можно также задать прямо здесь как запасной вариант)
 # ══════════════════════════════════════
-import os as _os
+import os
 
-GROUP_TOKEN  = _os.getenv("BOT_TOKEN",    "vk1.a.qM8MOyWFdXqj449qmyEMVh8_2u6ldFE2ZOkNADpq8Tr55JRc0xrEluF3bZDlPm9rfuFLHGRh1Zpw8YK72S2DGRh2rzkvGJMZQ1rg7-0zb4pMBF8WxhPug3CEUBN_aw3zN36zH-7QVCbraGpctmUePoRQj_Mp2SRFUKJCFzY_vtc5LDrlVlWRlVTCVI91EclOuwwp13BINZaOHd0_1JQXiw")
-GROUP_ID     = int(_os.getenv("GROUP_ID",     "238443976"))
-MASTER_VK_ID = int(_os.getenv("MASTER_VK_ID", "401276566"))
+GROUP_TOKEN  = os.getenv("BOT_TOKEN",    "vk1.a.qM8MOyWFdXqj449qmyEMVh8_2u6ldFE2ZOkNADpq8Tr55JRc0xrEluF3bZDlPm9rfuFLHGRh1Zpw8YK72S2DGRh2rzkvGJMZQ1rg7-0zb4pMBF8WxhPug3CEUBN_aw3zN36zH-7QVCbraGpctmUePoRQj_Mp2SRFUKJCFzY_vtc5LDrlVlWRlVTCVI91EclOuwwp13BINZaOHd0_1JQXiw")
+GROUP_ID     = int(os.getenv("GROUP_ID",     "238443976"))
+MASTER_VK_ID = int(os.getenv("MASTER_VK_ID", "401276566"))
 
 # ADMIN_IDS — через запятую в переменной окружения, например: 401276566,156902715
-_admin_env   = _os.getenv("ADMIN_IDS", "401276566,156902715")
+_admin_env   = os.getenv("ADMIN_IDS", "401276566,156902715")
 ADMIN_IDS    = set(int(x.strip()) for x in _admin_env.split(",") if x.strip())
 
-WELCOME_PHOTO = _os.getenv("WELCOME_PHOTO", "welcome.jpg")
-DB_FILE       = _os.getenv("DB_FILE",       "tattoo.db")
+WELCOME_PHOTO = os.getenv("WELCOME_PHOTO", "welcome.jpg")
+DB_FILE       = os.getenv("DB_FILE",       "tattoo.db")
 # ══════════════════════════════════════
 
 # В памяти храним только активные незавершённые анкеты
@@ -52,30 +51,9 @@ vk_session_global       = None   # инициализируется в main()
 # Храним не только message_id, но и user_id.
 processed_messages = set()
 
-# Защита от запуска двух копий бота одновременно
-# Если запущено 2 процесса — каждый отвечает на сообщение,
-# из-за этого пользователь получает дубли.
-LOCK_FILE = "bot.lock"
-
-def ensure_single_instance():
-    if os.path.exists(LOCK_FILE):
-        try:
-            with open(LOCK_FILE, "r", encoding="utf-8") as f:
-                old_pid = f.read().strip()
-
-            # Проверяем существует ли процесс
-            if old_pid:
-                try:
-                    os.kill(int(old_pid), 0)
-                    print(f"Бот уже запущен! PID: {old_pid}")
-                    sys.exit(1)
-                except:
-                    pass
-        except:
-            pass
-
-    with open(LOCK_FILE, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
+# Защита от двойного запуска через lock-файл убрана —
+# в контейнере всегда PID=1, она не работает.
+# Дубли предотвращаются через processed_messages и reconnect-loop.
 
 def is_duplicate_message(user_id: int, message_id: int) -> bool:
     key = (user_id, message_id)
@@ -836,8 +814,6 @@ def handle(vk, event, welcome_attach: str):
 # ══════════════════════════════════════
 
 def main():
-    ensure_single_instance()
-
     global vk_session_global
     db_init()  # создаёт tattoo.db при первом запуске
 
