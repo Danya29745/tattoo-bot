@@ -11,7 +11,6 @@ from vk_api.longpoll import VkLongPoll, VkEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 import logging
 import random
-import os
 import time
 import sqlite3
 import sys
@@ -25,15 +24,21 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ══════════════════════════════════════
-#  НАСТРОЙКИ
+#  НАСТРОЙКИ — читаем из переменных окружения
+#  (можно также задать прямо здесь как запасной вариант)
 # ══════════════════════════════════════
-GROUP_TOKEN  = "vk1.a.qM8MOyWFdXqj449qmyEMVh8_2u6ldFE2ZOkNADpq8Tr55JRc0xrEluF3bZDlPm9rfuFLHGRh1Zpw8YK72S2DGRh2rzkvGJMZQ1rg7-0zb4pMBF8WxhPug3CEUBN_aw3zN36zH-7QVCbraGpctmUePoRQj_Mp2SRFUKJCFzY_vtc5LDrlVlWRlVTCVI91EclOuwwp13BINZaOHd0_1JQXiw"
-GROUP_ID     = 238443976
-MASTER_VK_ID  = 401276566       # главный мастер — получает заявки
-ADMIN_IDS     = {401276566, 156902715}  # все админы — имеют доступ к панели
+import os as _os
 
-WELCOME_PHOTO = "welcome.jpg"
-DB_FILE       = "tattoo.db"
+GROUP_TOKEN  = _os.getenv("BOT_TOKEN",    "vk1.a.qM8MOyWFdXqj449qmyEMVh8_2u6ldFE2ZOkNADpq8Tr55JRc0xrEluF3bZDlPm9rfuFLHGRh1Zpw8YK72S2DGRh2rzkvGJMZQ1rg7-0zb4pMBF8WxhPug3CEUBN_aw3zN36zH-7QVCbraGpctmUePoRQj_Mp2SRFUKJCFzY_vtc5LDrlVlWRlVTCVI91EclOuwwp13BINZaOHd0_1JQXiw")
+GROUP_ID     = int(_os.getenv("GROUP_ID",     "238443976"))
+MASTER_VK_ID = int(_os.getenv("MASTER_VK_ID", "401276566"))
+
+# ADMIN_IDS — через запятую в переменной окружения, например: 401276566,156902715
+_admin_env   = _os.getenv("ADMIN_IDS", "401276566,156902715")
+ADMIN_IDS    = set(int(x.strip()) for x in _admin_env.split(",") if x.strip())
+
+WELCOME_PHOTO = _os.getenv("WELCOME_PHOTO", "welcome.jpg")
+DB_FILE       = _os.getenv("DB_FILE",       "tattoo.db")
 # ══════════════════════════════════════
 
 # В памяти храним только активные незавершённые анкеты
@@ -73,29 +78,20 @@ def ensure_single_instance():
         f.write(str(os.getpid()))
 
 def is_duplicate_message(user_id: int, message_id: int) -> bool:
-    """
-    Защита от дублей даже если запущено несколько контейнеров.
-    SQLite используется как общий atomic-lock.
-    """
-    key = f"{user_id}:{message_id}"
+    key = (user_id, message_id)
 
-    try:
-        with db_connect() as conn:
-            cur = conn.cursor()
+    if key in processed_messages:
+        return True
 
-            cur.execute(
-                "INSERT OR IGNORE INTO processed_events (event_key) VALUES (?)",
-                (key,)
-            )
+    processed_messages.add(key)
 
-            conn.commit()
+    # Чтобы set не рос бесконечно — удаляем случайную половину
+    if len(processed_messages) > 10000:
+        to_remove = list(processed_messages)[:5000]
+        for k in to_remove:
+            processed_messages.discard(k)
 
-            # Если запись уже существовала — это дубль
-            return cur.rowcount == 0
-
-    except Exception as e:
-        log.error("dedup error: %s", e)
-        return False
+    return False
 
 
 def get_admin_state(uid: int) -> dict:
@@ -133,11 +129,6 @@ def db_init():
                 has_photo    INTEGER DEFAULT 0,
                 has_sketch   INTEGER DEFAULT 0,
                 created_at   TEXT DEFAULT (datetime('now','localtime'))
-            );
-
-            CREATE TABLE IF NOT EXISTS processed_events (
-                event_key TEXT PRIMARY KEY,
-                created_at TEXT DEFAULT (datetime('now','localtime'))
             );
         """)
     log.info("БД инициализирована: %s", DB_FILE)
@@ -849,17 +840,6 @@ def main():
 
     global vk_session_global
     db_init()  # создаёт tattoo.db при первом запуске
-
-    # Чистим старые processed events
-    try:
-        with db_connect() as conn:
-            conn.execute("""
-                DELETE FROM processed_events
-                WHERE created_at < datetime('now', '-2 day')
-            """)
-            conn.commit()
-    except Exception as e:
-        log.error("cleanup processed_events: %s", e)
 
     vk_session        = vk_api.VkApi(token=GROUP_TOKEN)
     vk_session_global = vk_session   # нужен для загрузки документов внутри handle()
