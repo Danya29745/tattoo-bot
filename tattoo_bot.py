@@ -850,12 +850,31 @@ def main():
 
     log.info("VALHALLA Bot запущен. PID=%s БД: %s", os.getpid(), os.path.abspath(DB_FILE))
 
-    for event in longpoll.listen():
-        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+    while True:
+        try:
+            for event in longpoll.listen():
+                if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+                    try:
+                        handle(vk, event, welcome_attach)
+                    except Exception as e:
+                        log.exception("Ошибка обработки (uid=%s): %s", getattr(event, "user_id", "?"), e)
+
+        except KeyboardInterrupt:
+            log.info("Бот остановлен вручную.")
+            break
+
+        except Exception as e:
+            # ReadTimeout, ConnectionError и прочие сетевые ошибки —
+            # ждём 5 секунд и переподключаемся БЕЗ перезапуска процесса
+            log.warning("Соединение прервано (%s: %s) — переподключаюсь через 5 сек...",
+                        type(e).__name__, e)
+            time.sleep(5)
             try:
-                handle(vk, event, welcome_attach)
-            except Exception as e:
-                log.exception("Ошибка (uid=%s): %s", getattr(event, "user_id", "?"), e)
+                longpoll = VkLongPoll(vk_session, group_id=GROUP_ID)
+                log.info("Переподключение успешно.")
+            except Exception as e2:
+                log.error("Не удалось переподключиться: %s — повторю через 10 сек.", e2)
+                time.sleep(10)
 
 
 if __name__ == "__main__":
